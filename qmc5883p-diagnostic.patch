@@ -1,0 +1,214 @@
+diff --git a/src/detect/ScanI2C.cpp b/src/detect/ScanI2C.cpp
+index aa25ab5..d563958 100644
+--- a/src/detect/ScanI2C.cpp
++++ b/src/detect/ScanI2C.cpp
+@@ -44,8 +44,8 @@ ScanI2C::FoundDevice ScanI2C::firstAccelerometer() const
+ 
+ ScanI2C::FoundDevice ScanI2C::firstMagnetometer() const
+ {
+-    ScanI2C::DeviceType types[] = {MMC5983MA};
+-    return firstOfOrNONE(1, types);
++    ScanI2C::DeviceType types[] = {MMC5983MA, QMC5883P};
++    return firstOfOrNONE(2, types);
+ }
+ 
+ ScanI2C::FoundDevice ScanI2C::firstAQI() const
+diff --git a/src/detect/ScanI2C.h b/src/detect/ScanI2C.h
+index 7c4f2f0..cfef03f 100644
+--- a/src/detect/ScanI2C.h
++++ b/src/detect/ScanI2C.h
+@@ -99,6 +99,7 @@ class ScanI2C
+         CW2015,
+         SCD30,
+         ADS1115,
++        QMC5883P,
+     } DeviceType;
+ 
+     // typedef uint8_t DeviceAddress;
+diff --git a/src/detect/ScanI2CTwoWire.cpp b/src/detect/ScanI2CTwoWire.cpp
+index fe5d727..b92eebe 100644
+--- a/src/detect/ScanI2CTwoWire.cpp
++++ b/src/detect/ScanI2CTwoWire.cpp
+@@ -1,6 +1,7 @@
+ #include "ScanI2CTwoWire.h"
+ #include "configuration.h"
+ #include "detect/ScanI2C.h"
++#include "motion/QMC5883PDiagnostic.h"
+ 
+ #if !MESHTASTIC_EXCLUDE_I2C
+ 
+@@ -297,6 +298,23 @@ void ScanI2CTwoWire::scanPort(I2CPort port, uint8_t *address, uint8_t asize)
+         type = NONE;
+         if (err == 0) {
+             switch (addr.address) {
++#ifdef HELTEC_MESH_NODE_T096
++            case 0x2c: {
++                if (port != I2CPort::WIRE)
++                    break;
++                uint8_t id = 0;
++                if (QMC5883PDiagnostic::identify(i2cBus, id)) {
++                    LOG_INFO("QMC5883P probe: address=0x2c port=%d ID=0x%02x", port, id);
++                    if (id == 0x80) {
++                        type = QMC5883P;
++                        logFoundDevice("QMC5883P", addr.address);
++                    }
++                } else {
++                    LOG_WARN("QMC5883P probe: address=0x2c ID read failed");
++                }
++                break;
++            }
++#endif
+             case SSD1306_ADDRESS_H:
+             case SSD1306_ADDRESS_L:
+                 type = probeOLED(addr);
+diff --git a/src/main.cpp b/src/main.cpp
+index 084dd29..844b3ca 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -129,6 +129,7 @@ AccelerometerThread *accelerometerThread = nullptr;
+ #endif
+ #if !defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_I2C && !MESHTASTIC_EXCLUDE_MAGNETOMETER
+ #include "motion/MagnetometerThread.h"
++#include "motion/QMC5883PDiagnostic.h"
+ MagnetometerThread *magnetometerThread = nullptr;
+ #endif
+ 
+@@ -773,6 +774,11 @@ void setup()
+     }
+ #endif
+ #if !defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_MAGNETOMETER
++#ifdef HELTEC_MESH_NODE_T096
++    if (mag_info.type == ScanI2C::DeviceType::QMC5883P) {
++        new QMC5883PDiagnostic(mag_info.address.port == ScanI2C::WIRE1 ? &Wire1 : &Wire);
++    } else
++#endif
+     if (mag_info.type != ScanI2C::DeviceType::NONE) {
+         magnetometerThread = new MagnetometerThread(mag_info.type);
+     }
+diff --git a/src/motion/QMC5883PDiagnostic.h b/src/motion/QMC5883PDiagnostic.h
+new file mode 100644
+--- /dev/null
++++ b/src/motion/QMC5883PDiagnostic.h
+@@ -0,0 +1,122 @@
++#pragma once
++
++#include "configuration.h"
++
++#if defined(HELTEC_MESH_NODE_T096) && !MESHTASTIC_EXCLUDE_I2C
++#include "concurrency/OSThread.h"
++#include <Wire.h>
++
++class QMC5883PDiagnostic : public concurrency::OSThread
++{
++  public:
++    explicit QMC5883PDiagnostic(TwoWire *bus) : OSThread("QMC5883P-diag", 1000), bus(bus) {}
++
++    static bool identify(TwoWire *bus, uint8_t &id)
++    {
++        return readRegisters(bus, 0x00, &id, 1);
++    }
++
++  protected:
++    int32_t runOnce() override
++    {
++        if (!initialized) {
++            uint8_t id = 0;
++            if (!identify(bus, id) || id != 0x80) {
++                LOG_WARN("QMC5883P diagnostic: ID read failed or unexpected ID=0x%02x; no configuration writes", id);
++                return disable();
++            }
++            LOG_INFO("QMC5883P diagnostic v1: address=0x2c Chip ID=0x%02x SDA=P0.07 SCL=P0.08", id);
++            if (!readRegisters(bus, 0x0a, &originalControl1, 1) || !readRegisters(bus, 0x0b, &originalControl2, 1))
++                return fail();
++            controlsSaved = true;
++            // Preserve reserved bits; disable reset/self-test, use +/-8 G and set/reset on.
++            uint8_t control2 = (originalControl2 & 0x30) | 0x08;
++            if (!writeRegister(0x0a, 0x00) || !writeRegister(0x0b, control2) || !writeRegister(0x0a, 0x01))
++                return fail();
++            uint8_t check1 = 0, check2 = 0;
++            if (!readRegisters(bus, 0x0a, &check1, 1) || !readRegisters(bus, 0x0b, &check2, 1) || check1 != 0x01 ||
++                check2 != control2)
++                return fail();
++            initialized = true;
++            LOG_INFO("QMC5883P diagnostic: 10 Hz, +/-8 G; raw XYZ once per second for 120 seconds; no compass calibration");
++            return 1000;
++        }
++
++        if (++attempts > 120) {
++            if (restore())
++                LOG_INFO("QMC5883P diagnostic complete; original controls restored; reboot to repeat");
++            return disable();
++        }
++        uint8_t status = 0;
++        if (!readRegisters(bus, 0x09, &status, 1))
++            return fail();
++        if (!(status & 0x01)) {
++            LOG_WARN("QMC5883P diagnostic: data not ready status=0x%02x", status);
++            return 1000;
++        }
++        uint8_t data[6];
++        if (!readRegisters(bus, 0x01, data, sizeof(data)))
++            return fail();
++        int16_t x = static_cast<int16_t>((uint16_t(data[1]) << 8) | data[0]);
++        int16_t y = static_cast<int16_t>((uint16_t(data[3]) << 8) | data[2]);
++        int16_t z = static_cast<int16_t>((uint16_t(data[5]) << 8) | data[4]);
++        if (status & 0x02)
++            LOG_WARN("QMC5883P diagnostic: OVERFLOW status=0x%02x; discard sample", status);
++        else
++            LOG_INFO("QMC5883P raw: X=%d Y=%d Z=%d status=0x%02x", x, y, z, status);
++        return 1000;
++    }
++
++  private:
++    TwoWire *bus;
++    bool initialized = false;
++    bool controlsSaved = false;
++    uint8_t originalControl1 = 0, originalControl2 = 0;
++    uint16_t attempts = 0;
++
++    static bool readRegisters(TwoWire *bus, uint8_t reg, uint8_t *data, uint8_t count)
++    {
++        bus->beginTransmission(0x2c);
++        bus->write(reg);
++        if (bus->endTransmission(false) != 0)
++            return false;
++        if (bus->requestFrom(uint8_t(0x2c), count) != count) {
++            while (bus->available())
++                bus->read();
++            return false;
++        }
++        for (uint8_t i = 0; i < count; ++i)
++            data[i] = bus->read();
++        return true;
++    }
++
++    bool writeRegister(uint8_t reg, uint8_t value)
++    {
++        bus->beginTransmission(0x2c);
++        bus->write(reg);
++        bus->write(value);
++        return bus->endTransmission() == 0;
++    }
++
++    bool restore()
++    {
++        if (controlsSaved) {
++            bool stopped = writeRegister(0x0a, 0x00);
++            bool restored2 = writeRegister(0x0b, originalControl2 & 0x3f);
++            bool restored1 = writeRegister(0x0a, originalControl1);
++            if (!stopped || !restored2 || !restored1) {
++                LOG_WARN("QMC5883P diagnostic: restoring controls failed");
++                return false;
++            }
++        }
++        return true;
++    }
++
++    int32_t fail()
++    {
++        LOG_WARN("QMC5883P diagnostic: I2C/configuration error; stopping");
++        restore();
++        return disable();
++    }
++};
++#endif
