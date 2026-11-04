@@ -1,0 +1,77 @@
+name: Build T096 QMC5883P diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Read supplied patch and verifier
+        uses: actions/checkout@v4
+      - name: Fetch exact official firmware
+        uses: actions/checkout@v4
+        with:
+          repository: meshtastic/firmware
+          ref: v2.7.26.54e0d8d
+          path: firmware
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare pinned framework and patch
+        shell: bash
+        run: |
+          test "$(git -C firmware rev-parse HEAD)" = 54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb
+          git -C firmware apply --check ../qmc5883p-diagnostic.patch
+          git -C firmware apply ../qmc5883p-diagnostic.patch
+          git clone --no-checkout https://github.com/meshtastic/Adafruit_nRF52_Arduino.git framework
+          git -C framework checkout 9ddcbc9568b12f102f9e88bd4d1b88ea789213a4
+          git -C framework submodule update --init --recursive
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('firmware/variants/nrf52840/nrf52.ini')
+          s = p.read_text()
+          old = 'https://github.com/meshtastic/Adafruit_nRF52_Arduino#cpp17-platform'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'file://../framework'))
+          PY
+          python -m pip install platformio==6.2.0
+      - name: Build using the prescribed GCC 9.3.1
+        shell: bash
+        run: python -m platformio run -d firmware -e heltec-mesh-node-t096 -j 2 2>&1 | tee build.log
+      - name: Verify and name the UF2
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import shutil
+          from pathlib import Path
+          from verify_uf2 import inspect
+          source = Path('firmware/.pio/build/heltec-mesh-node-t096/firmware-heltec-mesh-node-t096-2.7.26.54e0d8d.uf2')
+          result = inspect(source)
+          assert result['has_diagnostic_marker'] and result['has_xyz_log']
+          output = Path('verified')
+          output.mkdir()
+          target = output / (source.stem + '-qmc5883p-diag-v1.uf2')
+          shutil.copy2(source, target)
+          (output / 'UF2-verification.json').write_text(json.dumps(result, indent=2))
+          shutil.copy2('build.log', output / 'build-success.log')
+          PY
+      - name: Publish only a successful verified build
+        uses: actions/upload-artifact@v4
+        with:
+          name: T096-QMC5883P-verified-UF2
+          path: verified/
+          if-no-files-found: error
+      - name: Keep failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: T096-build-failure-log
+          path: build.log
+          if-no-files-found: ignore
